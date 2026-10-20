@@ -1,9 +1,16 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
-from FinMind.data import DataLoader
 
 st.set_page_config(page_title="台股訊號查詢", page_icon="📈", layout="wide")
+
+# FinMind 若安裝失敗，直接在頁面顯示原因（而不是只出現 Oh no）
+try:
+    from FinMind.data import DataLoader
+except Exception as _e:
+    st.error("FinMind 載入失敗，請檢查 requirements.txt / Python 版本 / 部署記錄。")
+    st.exception(_e)
+    st.stop()
 
 # ==================== 取得 FinMind Token（可選）====================
 def _secret_token():
@@ -38,7 +45,11 @@ def check_revenue_accurate(rev_df):
         .drop_duplicates(["_y", "_m"], keep="last")
         .reset_index(drop=True)
     )
-    lookup = {(int(r._y), int(r._m)): r.revenue for r in rev_df.itertuples()}
+    # 注意：itertuples 會把底線開頭的欄位改名，所以改用 zip 取值
+    lookup = {
+        (int(y_), int(m_)): float(v)
+        for y_, m_, v in zip(rev_df["_y"], rev_df["_m"], rev_df["revenue"])
+    }
 
     latest_y, latest_m = int(rev_df.iloc[-1]["_y"]), int(rev_df.iloc[-1]["_m"])
     recent_periods = []
@@ -72,25 +83,34 @@ def fetch_fundamental(tk: str, token: str) -> dict:
     if token:
         dl.login_by_token(api_token=token)
     start_f_date = "2023-01-01"
-    out = {"rev_pass": False, "rev_note": "", "roe_pass": False, "roe_val": 0.0, "pe_val": np.nan}
+    out = {"rev_pass": False, "rev_note": "", "roe_pass": False, "roe_val": 0.0,
+           "pe_val": np.nan, "errors": []}
+
+    # 三項各自獨立 try：任何一項失敗，不會連累其他項
     try:
         rev_df = dl.taiwan_stock_month_revenue(stock_id=tk, start_date=start_f_date)
         out["rev_pass"], out["rev_note"] = check_revenue_accurate(rev_df)
+    except Exception as e:
+        out["errors"].append(f"{tk} 營收：{type(e).__name__}: {e}")
 
+    try:
         roe_df = dl.taiwan_stock_financial_statement(stock_id=tk, start_date=start_f_date)
         if not roe_df.empty:
             roe_data = roe_df[roe_df["type"] == "ROE"]
             if not roe_data.empty:
                 out["roe_val"] = float(roe_data.iloc[-1]["value"])
                 out["roe_pass"] = out["roe_val"] > 0
+    except Exception as e:
+        out["errors"].append(f"{tk} ROE：{type(e).__name__}: {e}")
 
+    try:
         per_df = dl.taiwan_stock_per_pbr(stock_id=tk, start_date="2024-01-01")
         if not per_df.empty:
             valid_pe = per_df[per_df["PER"] > 0]
             if not valid_pe.empty:
                 out["pe_val"] = float(valid_pe.iloc[-1]["PER"])
-    except Exception:
-        pass
+    except Exception as e:
+        out["errors"].append(f"{tk} 本益比：{type(e).__name__}: {e}")
     return out
 
 
@@ -265,8 +285,9 @@ def compute(target, peers, token, P):
     if climax_hit:
         sell_score += 2; sell_reason.append("★高潮走勢：急漲+爆量同時出現")
 
+    fund_errors = [m for v in fund.values() for m in v.get("errors", [])]
     return dict(
-        df=df, t=t, y=y, f=f, pe_threshold=pe_threshold,
+        df=df, t=t, y=y, f=f, pe_threshold=pe_threshold, fund_errors=fund_errors,
         fundamental_score=fundamental_score, fundamental_reasons=fundamental_reasons,
         kd_reason=kd_reason, macd_reason=macd_reason, chip_reason=chip_reason,
         buy_raw=buy_raw, buy_total=buy_total, tech_buy=tech_buy, tech_confirmed=tech_confirmed,
@@ -391,7 +412,8 @@ try:
     with st.spinner("抓取資料與計算中..."):
         R = compute(target, peers, token, P)
 except Exception as e:
-    st.error(f"查詢失敗：{e}")
+    st.error(f"查詢失敗：{type(e).__name__}: {e}")
+    st.exception(e)
     st.stop()
 
 t, y = R["t"], R["y"]
@@ -445,6 +467,10 @@ st.markdown("### 🧱 基本面")
 st.write(f"基本面得分：**{R['fundamental_score']}/6**")
 st.caption(" ｜ ".join(R["fundamental_reasons"]) if R["fundamental_reasons"] else "基本面條件未滿足")
 st.caption(f"營收檢核：{R['f'].get('rev_note', '')}")
+if R["fund_errors"]:
+    with st.expander("⚠️ 基本面資料抓取警告（點開查看）"):
+        for msg in R["fund_errors"]:
+            st.write("- " + msg)
 pe_t = R["pe_threshold"]
 st.caption(
     f"本益比 {R['f']['pe_val']:.1f}　族群30%分位門檻 {pe_t:.1f}"

@@ -32,7 +32,11 @@ def check_revenue_accurate(rev_df):
         .drop_duplicates(["_y", "_m"], keep="last")
         .reset_index(drop=True)
     )
-    lookup = {(int(r._y), int(r._m)): r.revenue for r in rev_df.itertuples()}
+    # 注意：itertuples 會把底線開頭的欄位改名，所以改用 zip 取值
+    lookup = {
+        (int(y_), int(m_)): float(v)
+        for y_, m_, v in zip(rev_df["_y"], rev_df["_m"], rev_df["revenue"])
+    }
 
     latest_y, latest_m = int(rev_df.iloc[-1]["_y"]), int(rev_df.iloc[-1]["_m"])
     recent_periods = []
@@ -85,50 +89,54 @@ def get_fundamental_scores(tickers, target):
     print("🔍 正在抓取基本面數據（營收、ROE、本益比）...")
 
     for tk in tickers:
+        # 三項各自獨立 try：任何一項失敗，不會連累其他項
+        rev_pass, rev_note = False, ""
+        roe_pass, latest_roe = False, 0
+        latest_pe = np.nan
+
+        # 1. 抓月營收計算：近 3 個月營收合計 vs 去年同期
         try:
-            # 1. 抓月營收計算：近 3 個月營收合計 vs 去年同期
             rev_df = dl.taiwan_stock_month_revenue(
                 stock_id=tk, start_date=start_f_date
             )
             rev_pass, rev_note = check_revenue_accurate(rev_df)
+        except Exception as e:
+            rev_note = f"營收檢核失敗：{type(e).__name__}: {e}"
+            print(f"⚠️ {tk} {rev_note}")
 
-            # 2. 抓 ROE：最新一季 ROE > 0
+        # 2. 抓 ROE：最新一季 ROE > 0
+        try:
             roe_df = dl.taiwan_stock_financial_statement(
                 stock_id=tk, start_date=start_f_date
             )
-            roe_pass = False
-            latest_roe = 0
             if not roe_df.empty:
                 roe_data = roe_df[roe_df["type"] == "ROE"]
                 if not roe_data.empty:
                     latest_roe = float(roe_data.iloc[-1]["value"])
                     roe_pass = latest_roe > 0
+        except Exception as e:
+            print(f"⚠️ {tk} ROE 抓取失敗：{type(e).__name__}: {e}")
 
-            # 3. 抓 PE (本益比)
+        # 3. 抓 PE (本益比)
+        try:
             per_df = dl.taiwan_stock_per_pbr(
                 stock_id=tk, start_date="2024-01-01"
             )
-            latest_pe = np.nan
             if not per_df.empty:
                 valid_pe = per_df[per_df["PER"] > 0]
                 if not valid_pe.empty:
                     latest_pe = float(valid_pe.iloc[-1]["PER"])
-
-            pe_list[tk] = latest_pe
-            fund_scores[tk] = {
-                "rev_pass": rev_pass,
-                "rev_note": rev_note,
-                "roe_pass": roe_pass,
-                "roe_val": latest_roe,
-                "pe_val": latest_pe,
-            }
         except Exception as e:
-            fund_scores[tk] = {
-                "rev_pass": False,
-                "roe_pass": False,
-                "roe_val": 0,
-                "pe_val": np.nan,
-            }
+            print(f"⚠️ {tk} 本益比抓取失敗：{type(e).__name__}: {e}")
+
+        pe_list[tk] = latest_pe
+        fund_scores[tk] = {
+            "rev_pass": rev_pass,
+            "rev_note": rev_note,
+            "roe_pass": roe_pass,
+            "roe_val": latest_roe,
+            "pe_val": latest_pe,
+        }
 
     # 計算族群本益比 30% 分位數 (低價門檻)
     valid_pes = [v for v in pe_list.values() if not np.isnan(v)]
@@ -481,6 +489,4 @@ else:
 # ---------- 附註提醒 ----------
 if not climax_hit and (roc_hit or vol_hit):
     print("⚠️ 注意：高潮條件已成立其一，請留意風險管理，已有獲利者可考慮部分落袋為安")
-if (not buy_blocked) and buy_total >= 4 and sell_score >= 5:
-    print("⚠️ 買賣訊號同時偏強、方向矛盾：建議以賣出建議（風險控管）為優先，或縮小部位")
 print("=" * 100)
